@@ -125,7 +125,8 @@ two scripts in `tools/` drive it. they need gawk and the OpenBSD netcat (`nc -d`
 `recordings/` holds what this README quotes from, all of entity 2 on 2026-10-04, on a GW60 on the
 bench that moves no shutter, its end positions set about 19 seconds of travel apart: `a` to `d`
 are eight full travels with the CLK LED off, `e` to `g` came an hour later with the LED on - `g`
-is the stop and reverse test below
+is the stop and reverse test below - and `h` is one more travel up and down with the LED off
+again, three hours after `a`
 
 what the reed line carries
 --------------------------
@@ -151,8 +152,8 @@ measured in `recordings/`:
   (mostly 50-75us, 243us at most, about 6 extra edges), opening is a single clean edge in 242 of
   254 cases
 - the reed starts switching 0.32-0.45s after the key press begins, then cycles every 0.69-0.70s:
-  about 280ms closed, 410-420ms open (duty about 40.5%), for 18.9-19.3s. every travel recorded,
-  4 up and 4 down, had exactly 28 of these cycles
+  about 280ms closed, 410-420ms open (duty about 40.5%), for 18.9-19.3s. every full travel recorded,
+  6 up and 6 down, had exactly 28 of these cycles
 - in each up/down pair, going down took 0.6-0.9% longer per cycle (median 694.7-701.5ms against
   689.3-697.2ms) - on this bench, with no shutter to lift
 - the second, larger gear shows every 5th cycle. when its magnet comes by in the reed's open
@@ -257,8 +258,8 @@ every few of them, and how wide depends on the direction. from the test above (l
 - a closure lets through about 17 pulses, a few of them wide: going by the majority of its wide
   pulses, 84 of the 85 closures in motion that had any told the right direction. the one miss was
   the last closure, as the motor stopped at the lower end
-- with the LED off there is nothing of the kind: no scan pulse in the 10008 edges of `a` to `d`
-  is wider than 17us, and width and period are the same in either direction, to a few
+- with the LED off there is nothing of the kind: no scan pulse in `a` to `d` or in `h` is wider
+  than 17us, and width and period are the same in either direction, to a few
   nanoseconds and a microsecond
 
 from the reed pattern, with the LED off or on:
@@ -278,14 +279,16 @@ from the reed pattern, with the LED off or on:
   closures after cycles 12 and 27 came late going down and early going up - the other way round
   (with the LED on these times are good to one scan period, 16ms). each one still sat at the same
   place from either side, so it is a matter of the position, and of how far the drift has got,
-  not of the direction
+  not of the direction. in `h`, with the LED off again, all six extra closures showed in both
+  directions, 64-113ms long and most of them near the middle of their open phase: going up, those
+  after cycles 2 and 7 came late and the other four early, going down all six came late
 - what does not depend on any of it: a movement that starts at an end position can only go one
   way, and from there the firmware could count cycles
 
 still open:
 
 - a real shutter on the belt: its weight changes the speed both ways, perhaps the wide pulses too
-- whether the pause at a motor stop differs with the direction: 43.68-43.69ms the three times
+- whether the pause at a motor stop differs with the direction: 43.68-43.72ms the four times
   going down, 43.80 and 43.93ms the two times going up - too few to tell
 - longer series: does the relation between the gears keep drifting, and why does it drift at all?
 
