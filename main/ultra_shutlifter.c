@@ -48,6 +48,7 @@ done
 #elif ESP32_(2)              // pre crafted development board
 #   define DEBUG 10
 #   define MYSERVICE_PORT 8888         // enable/disable function
+#   define REEDREC_PORT 8889           // enable/disable function: stream every PIN_REED edge (tools/reedrec)
 #else
 #   this may not happen
 #endif
@@ -109,6 +110,42 @@ _u8  error_buf[32];
 _u32 new_movement;                      // timestamp of last (still unreported) movement registered
 
 /*
+ * some theory of operation - how PIN_REED works (the numbers as the reed recorder measured them on
+ * the bench, see README.md and recordings/):
+ *
+ * - PIN_REED is connected via a voltage divider to the output of the reed relais.
+ * - the reed relais input is connected to rail_2
+ * - so if the reed relais closes contact we read the voltage present on rail_2. with the contact
+ *   open the divider holds PIN_REED at 0V
+ * - rail_2 basically controls the CLK LED cathode voltage meaning that: 5V on rail_2 - CLK LED OFF/ 0V on rail_2 - CLK LED ON
+ * - additionally voltage on rail_2 is continuously overlaid by pulses at frequency 61Hz (every 16.35ms) and pulse width of
+ *   14us - 17us while the GW60 sees one of its keys pressed. with the CLK LED off a pulse is a dip to 0V, with the LED on
+ *   it should be a spike to 5V (not recorded yet)
+ * - with the CLK LED off, PIN_REED follows the reed contact itself between the pulses: the contact closing is a rising
+ *   edge at any phase, followed by ~70us of bounce - rising edges for reed_intrs() too, at no 16ms distance
+ * - the small magnetic wheel (with 2 magnets baked in) causes ~280ms in length reed contact closures being spaced at
+ *   about 700ms, the contact being open for ~415ms in between
+ * - so each reed contact closure contains: 0.280s / (1 / 61)s = 17.1 pulses (per burst), 14 to 18 counted
+ * - the larger magnetic wheel repeats every 5 closures: it stretches or shortens them (232ms to 300ms), and where its
+ *   magnet passes the open contact it closes it once more, briefly (47ms to 109ms, a burst of a few pulses) - on the bench
+ *   after closures 2, 7, 12, 17, 22 and 27, counted from the lower end. its relation to the small wheel drifts slowly
+ *
+ * |                           |
+ * |closed reed pulse          |
+ * |             burst distance|
+ * |                           |
+ *
+ * <------------700ms---------->
+ * |||||||______________________|||||||______________________|||||||______________________
+ * <----->              ...---->
+ * |280ms|               ~415ms silence
+ * |closed                 movd trigger: the first rising edge after more than MIN_GAP_TO_DETECT_MOVEMENT of silence
+ * |reed |
+ * |burst|
+ * |length|
+ */
+
+/*
  * client configurable variables
  */
 _u32 cfg_autostop = 200;                // auto stop adjustment travel after this (ms)
@@ -139,7 +176,7 @@ dump_err()
     error_cnt = 0;
 }
 
-// every other 16ms
+// about every other 16ms (~61Hz)
 void
 IRAM_ATTR reed_intrs(void *arg)
 {
@@ -178,7 +215,7 @@ IRAM_ATTR reed_intrs(void *arg)
             }
             ++reed_intr_consecutives;
         } else if (timer_interval > MIN_GAP_TO_DETECT_MOVEMENT) {
-            // movement reporting triggers on new pulses after >200ms silence
+            // movement reporting triggers on new pulses after more than MIN_GAP_TO_DETECT_MOVEMENT of silence
             // the minimum limit for the absence of pulses additionally defines
             // the max rate of reported movements
             new_movement = intr_now;
@@ -235,6 +272,313 @@ TP05
     gpio_set_intr_type(PIN_REED, GPIO_INTR_POSEDGE);    // RISING
     gpio_isr_handler_add(PIN_REED, reed_intrs, 0);      // associate PIN and trigger-cond to fct (and enables it)
 }
+
+// ======================================== reed recorder ========================================
+#if defined(REEDREC_PORT)
+/*
+ * streams every edge PIN_REED makes to whoever connects to REEDREC_PORT, for as long as the
+ * connection lasts - the raw material for working out what the lifter's reed line carries (see
+ * README.md and tools/). one line per event, t in us since the connect:
+ *
+ *      <t> 0|1         an edge, and the level it went to
+ *      <t> = 0|1       the level sampled at the connect, then after every REC_QUIET_MS of silence
+ *      <t> cmd <CMD>   the service port starts executing <CMD>, i.e. its key press begins
+ *      <t> done <CMD>  ... and is through with it
+ *      <t> lost <n>    the ring ran over: n events are missing right before this line
+ *
+ * the edges are timestamped by hardware, not by an interrupt handler. the line carries pulses
+ * only 14us wide, and an ISR that reads a clock or the pin level can be late by more than that
+ * whenever wifi or the flash holds the cpu - it would see the two edges of such a pulse as one.
+ * two mcpwm capture channels watch the pin instead, one per edge direction, each latching the
+ * 80MHz capture timer at the edge itself: the value stays exact however late it is read, and the
+ * two edges of a pulse land in two different registers, so neither overwrites the other. what
+ * still overwrites is a second edge of the same direction within the interrupt latency - reed
+ * bounce, a few us apart: the recording then shows one level twice in a row, an edge pair lost
+ * in between and the level after it right.
+ * all of it runs beside reed_intrs(), which is left alone: the capture driver only routes the
+ * pin's input into the mcpwm through the gpio matrix and never touches the pin's interrupt type.
+ * the capture interrupt and the stream task live on core 1, away from wifi
+ */
+#include "driver/mcpwm_cap.h"
+
+#define REC_RING 2048                   // events between capture interrupt and stream task, power of 2
+#define REC_CHUNK 64                    // events taken out of the ring per pass
+#define REC_POLL 50                     // ms between passes over an empty ring
+#define REC_QUIET_MS 500                // a "=" line after this long without any other line
+#define REC_SEND_TIMEOUT 10             // x 1s, a client that stops reading ends the recording
+
+enum { REC_FALL, REC_RISE, REC_CMD, REC_DONE, REC_LOST };   // FALL/RISE == the level an edge goes to
+
+typedef struct {
+    _i64 t;                             // capture timer ticks since the connect
+    _u32 kind;
+    _u32 arg;                           // REC_CMD/REC_DONE: slot in rec_names[], REC_LOST: count
+} rec_ev_t;
+
+rec_ev_t rec_ring[REC_RING];
+_u32 rec_head, rec_tail;                // free running, masked on access
+_u32 rec_lost;                          // events dropped since the ring last had room
+portMUX_TYPE rec_mux = portMUX_INITIALIZER_UNLOCKED;   // guards all of the above, the ref and the names
+volatile bool rec_on;                   // a client is connected
+_u32 rec_tpu;                           // capture timer ticks per us (80: APB, fixed on the esp32)
+_i64 rec_t0;                            // esp_timer_get_time() at the connect
+_i64 rec_ref_us;                        // esp_timer_get_time() at the first edge of a recording, 0 before it
+_u32 rec_ref_cap;                       // ... and that edge's capture value
+
+/*
+ * a cmd name lives here from rec_mark() until its line is out. cmds run one at a time and each
+ * holds the service port for 500ms at least, so a slot is not wanted again for seconds
+ */
+_i8 rec_names[8][16];
+_u32 rec_name_seq;
+
+/*
+ * rec_mux held. one slot is always kept back, so that the first event after an overrun can
+ * close the gap with a REC_LOST
+ */
+void
+IRAM_ATTR rec_push(_i64 t, _u32 kind, _u32 arg)
+{
+    if (rec_head - rec_tail > REC_RING - 2) {
+        ++rec_lost;
+        return;
+    }
+    if (rec_lost) {
+        rec_ring[rec_head++ & (REC_RING - 1)] = (rec_ev_t){ t, REC_LOST, rec_lost };
+        rec_lost = 0;
+    }
+    rec_ring[rec_head++ & (REC_RING - 1)] = (rec_ev_t){ t, kind, arg };
+}
+
+/*
+ * one call per captured edge, arg is the level the edge went to. the capture timer is 32 bits at
+ * 80MHz and wraps every 53.7s - shorter than the reed line may stay silent - so the whole wraps
+ * since the recording's first edge are counted off esp_timer. that clock is read late by the
+ * interrupt latency, a few us, against a wrap of 2^32 ticks
+ */
+bool
+IRAM_ATTR rec_cap(mcpwm_cap_channel_handle_t chan, const mcpwm_capture_event_data_t *edata, void *arg)
+{
+    _i64 now = esp_timer_get_time();
+
+    if (rec_on) {
+        portENTER_CRITICAL_ISR(&rec_mux);
+        if (!rec_ref_us) {
+            rec_ref_us = now;
+            rec_ref_cap = edata->cap_value;
+        }
+        _u32 d = edata->cap_value - rec_ref_cap;                       // since the first edge, mod 2^32
+        _i64 wraps = ((now - rec_ref_us) * rec_tpu - d + ((_i64)1 << 31)) >> 32;
+
+        rec_push((rec_ref_us - rec_t0) * rec_tpu + d + wraps * ((_i64)1 << 32), (_u32)arg, 0);
+        portEXIT_CRITICAL_ISR(&rec_mux);
+    }
+    return false;
+}
+
+void
+rec_mark(_u32 kind, _i8cp name)
+{
+    _i64 now = esp_timer_get_time();
+
+    portENTER_CRITICAL(&rec_mux);
+    if (rec_on) {
+        _u32 slot = rec_name_seq++ % _NE(rec_names);
+
+        *rec_names[slot] = 0;
+        strncat(rec_names[slot], name, _SZ(rec_names[slot]) - 1);
+        rec_push((now - rec_t0) * rec_tpu, kind, slot);
+    }
+    portEXIT_CRITICAL(&rec_mux);
+}
+
+/*
+ * rising edges on one channel, falling ones on the other. the rising one is registered first
+ * because a shared interrupt calls its handlers newest first: when both edges of a dip - the
+ * pulse shape seen with the CLK LED off - are pending at once, they then reach the ring in order
+ */
+esp_err_t
+rec_capture_init(void)
+{
+    esp_err_t err;
+    mcpwm_cap_timer_handle_t timer;
+    mcpwm_capture_timer_config_t timer_config = {
+        .group_id = 0,
+        .clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT,
+    };
+    __u32 res;                          // uint32_t, which is unsigned long here
+    _u32 level;
+
+    if ((err = mcpwm_new_capture_timer(&timer_config, &timer)) != ESP_OK ||
+        (err = mcpwm_capture_timer_get_resolution(timer, &res)) != ESP_OK) {
+        return err;
+    }
+    rec_tpu = res / 1000000;
+    for (level = 2; level--; ) {
+        mcpwm_cap_channel_handle_t chan;
+        mcpwm_capture_channel_config_t chan_config = {
+            .gpio_num = PIN_REED,
+            .prescale = 1,
+            .flags.neg_edge = !level,
+            .flags.pos_edge = level,
+        };
+        mcpwm_capture_event_callbacks_t cbs = { .on_cap = rec_cap };
+
+        if ((err = mcpwm_new_capture_channel(timer, &chan_config, &chan)) != ESP_OK ||
+            (err = mcpwm_capture_channel_register_event_callbacks(chan, &cbs, (void *)level)) != ESP_OK ||
+            (err = mcpwm_capture_channel_enable(chan)) != ESP_OK) {
+            return err;
+        }
+    }
+    if ((err = mcpwm_capture_timer_enable(timer)) != ESP_OK ||
+        (err = mcpwm_capture_timer_start(timer)) != ESP_OK) {
+        return err;
+    }
+    PR05("reed recorder: capture at %u ticks/us on PIN %u\n", rec_tpu, PIN_REED);
+    return ESP_OK;
+}
+
+// us with two decimals, the capture resolution is 12.5ns
+_i32
+rec_fmt_t(_i8p str, _u32 siz, _i64 t)
+{
+    if (t < 0) t = 0;   // only an edge a few us ahead of the connect, swapped behind the first one
+    return snprintf(str, siz, "%lld.%02lld", t / rec_tpu, t % rec_tpu * 100 / rec_tpu);
+}
+
+/*
+ * one client at a time, a second one waits in the backlog until the first is gone. the stream
+ * ends when a send fails, i.e. once the client has closed - nothing is ever read from it
+ */
+void
+rec_task(void *arg)
+{
+TP05
+    _i32 listen_sock, client_sock;
+    struct sockaddr_in server_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(REEDREC_PORT),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+    esp_err_t err;
+    rec_ev_t ev[REC_CHUNK + 1];         // +1: the carry, see below
+    _u32 n, i, j, carry;
+    _i8 out[1536];
+    _i8 tstr[40];                       // what gcc proves rec_fmt_t() can need, 33
+    _i32 len;
+    bool ok;
+    _i64 now, last_line;
+
+    if ((err = rec_capture_init()) != ESP_OK) {      // here, so that the capture interrupt lands on core 1
+        PR00("reed recorder: capture setup failed: 0x%x\n", err);
+        vTaskDelete(0);
+    }
+    while (1) {
+        listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+        if (listen_sock < 0
+         || bind(listen_sock, (struct sockaddr *)&server_addr, _SZ(server_addr)) < 0
+         || listen(listen_sock, 1) < 0) {
+            if (listen_sock >= 0) close(listen_sock);
+            PR05("Error: reed recorder has no listen socket\n");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        PR05("reed recorder listening on port %d\n", REEDREC_PORT);
+        while ((client_sock = accept(listen_sock, 0, 0)) >= 0) {
+            struct timeval tv = { .tv_sec = REC_SEND_TIMEOUT, .tv_usec = 0 };
+            setsockopt(client_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, _SZ(tv));
+
+            portENTER_CRITICAL(&rec_mux);
+            rec_head = rec_tail = rec_lost = 0;
+            rec_ref_us = 0;
+            rec_t0 = esp_timer_get_time();
+            rec_on = 1;
+            portEXIT_CRITICAL(&rec_mux);
+            PR05("reed recorder: client connected\n");
+
+            len = snprintf(out, _SZ(out), "# reedrec %s pin %u\n0.00 = %d\n",
+                                                    DEVICE_FW, PIN_REED, gpio_get_level(PIN_REED));
+            last_line = esp_timer_get_time();
+            n = 0;
+            ok = 1;
+            while (ok) {
+                portENTER_CRITICAL(&rec_mux);
+                while (n < REC_CHUNK + 1 && rec_tail != rec_head) {
+                    ev[n++] = rec_ring[rec_tail++ & (REC_RING - 1)];
+                }
+                portEXIT_CRITICAL(&rec_mux);
+
+                /*
+                 * events can reach the ring a few us out of order: a positive pulse's two edges
+                 * when both are pending (the fall is served first), or a cmd mark against an edge
+                 * still waiting for its interrupt. sort what was taken, and while the ring may
+                 * still hold more, keep the latest event back for the next pass - so a swapped
+                 * pair split by the chunk boundary still comes out in order
+                 */
+                for (i = 1; i < n; ++i) {
+                    rec_ev_t e = ev[i];
+
+                    for (j = i; j && ev[j - 1].t > e.t; --j) {
+                        ev[j] = ev[j - 1];
+                    }
+                    ev[j] = e;
+                }
+                carry = n == REC_CHUNK + 1;
+
+                for (i = 0; ok && i < n - carry; ++i) {
+                    if (len > _SZ(out) - 64) {                  // room for the longest line, 55 chars
+                        ok = send(client_sock, out, len, 0) == len;
+                        len = 0;
+                    }
+                    rec_fmt_t(tstr, _SZ(tstr), ev[i].t);
+                    switch (ev[i].kind) {
+                    case REC_FALL:
+                    case REC_RISE:
+                        len += snprintf(out + len, _SZ(out) - len, "%s %u\n", tstr, ev[i].kind);
+                        break;
+                    case REC_CMD:
+                    case REC_DONE:
+                        len += snprintf(out + len, _SZ(out) - len, "%s %s %s\n", tstr,
+                                        ev[i].kind == REC_CMD ? "cmd" : "done", rec_names[ev[i].arg]);
+                        break;
+                    case REC_LOST:
+                        len += snprintf(out + len, _SZ(out) - len, "%s lost %u\n", tstr, ev[i].arg);
+                        break;
+                    }
+                }
+                if (carry) {
+                    ev[0] = ev[n - 1];
+                }
+                n = carry;
+
+                now = esp_timer_get_time();
+                if (len) {
+                    last_line = now;
+                } else if (now - last_line >= REC_QUIET_MS * 1000) {
+                    rec_fmt_t(tstr, _SZ(tstr), (now - rec_t0) * rec_tpu);
+                    len = snprintf(out, _SZ(out), "%s = %d\n", tstr, gpio_get_level(PIN_REED));
+                    last_line = now;
+                }
+                if (ok && len) {
+                    ok = send(client_sock, out, len, 0) == len;
+                    len = 0;
+                }
+                if (!carry) {
+                    vTaskDelay(pdMS_TO_TICKS(REC_POLL));
+                }
+            }
+            rec_on = 0;
+            close(client_sock);
+            PR05("reed recorder: client gone\n");
+        }
+        close(listen_sock);
+        PR05("Error: accept failed\n");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+#else
+#define rec_mark(kind, name)
+#endif
 
 // ======================================== provide a service control port ========================================
 #if defined(MYSERVICE_PORT)
@@ -433,6 +777,7 @@ PR05("illegal cmd\n");
 #define ACTIVATE_FACRESET_DURATION 6000
 
             PR05("--- starting ---\n");
+            rec_mark(REC_CMD, cmd);
 // handle this separately for your safety
             if (!strcmp(cmd, "OTA")) {
                 intrs_off();
@@ -520,6 +865,7 @@ PR05("illegal cmd\n");
                 // nothing to do
             }
             PR05("--- completed ---\n");
+            rec_mark(REC_DONE, cmd);
             delay_ms(500);                      // allow the opto to settle/ maintain a gap to next cmd
         }
     }
@@ -595,6 +941,9 @@ TP05
         ESP_ERROR_CHECK(gptimer_enable(mytimer));                   // armed per reed edge, not here
     }
     intrs_on();
+#if defined(REEDREC_PORT)
+    xTaskCreatePinnedToCore(rec_task, "rec_task", 8192, 0, 5, 0, 1);   // core 1, see the reed recorder
+#endif
 
     /*
      * init_3rd() only started the connect, and mysend() then waited up to 6s per cmd for the link
@@ -633,19 +982,6 @@ void _loop(void)
     _u32 time_now = mstamp();
     _i8 cmd[64];
 
-    /*
-     * |closed reed pulse          |
-     * |             burst distance|
-     *
-     * <------------700ms---------->
-     * |||||||______________________|||||||______________________|||||||______________________
-     * <----->              ...---->
-     * |210ms|                >200ms silence
-     * |closed                 movd trigger
-     * |reed |
-     * |burst|
-     * |length|
-     */
     if (new_movement) {
         PR05("%u: new_movement recorded at %u\n", time_now, new_movement);
         new_movement = 0;

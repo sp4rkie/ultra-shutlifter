@@ -1,0 +1,305 @@
+#!/bin/sh
+#
+# reedana - what a reedrec recording says about the reed line
+#
+# usage:  reedana [-c] [-t] file.rec ...
+#
+#   -c   also list every cycle of every command
+#   -t   finally, the closed time of every cycle of every run side by side, one row per shutter
+#        position: UP runs as recorded, DOWN runs reversed. only meaningful for runs from one
+#        end position to the other
+#
+# per file:
+#
+#   scan pulses  the lifter tests its reed by pulsing the line every 16.35ms. with the CLK LED off
+#                the line idles high and a pulse is a dip, with it on the line idles low and a
+#                pulse is a spike - only a closed reed lets either through. their width, and
+#                separately the width of those that fall into a key press
+#   reed         when the reed closed and opened. with dips the line follows the reed itself and
+#                the edges give the exact switching times, bounce included. with spikes only the
+#                pulses can tell, so a closure is the run of pulses, good to one pulse period
+#   per cmd      what the reed did after each command the service port executed: how long until it
+#                first switched and for how long it went on. its cycles - closed, open, period
+#                (close to close), duty - as medians, since those at start and stop are not like
+#                the rest. a closure shorter than EXTRA x the median closed time is no cycle of
+#                its own: it is an extra one inside an open phase, and is listed with where it sat
+#                in that phase - how long after the closure before it, and how long before the next
+#
+# edges closer than CLUSTER us are taken as one event (bounce, or a pulse's two edges). two edges
+# of one direction a few us apart can reach the recording as one (README.md), seen as a level
+# repeating itself - counted as "merged", the level after it is right
+#
+
+CYCLES=0
+TABLE=0
+usage() {
+    sed -n '/^# usage/,/^#        end position/s/^# \{0,1\}//p' "$0" >&2
+    exit 1
+}
+while getopts ct o; do
+    case $o in
+    c) CYCLES=1 ;;
+    t) TABLE=1 ;;
+    *) usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || usage
+
+exec gawk -v cycles="$CYCLES" -v table="$TABLE" '
+BEGIN {
+    CLUSTER = 200           # us between edges of one event
+    PW_MIN = 10             # us, the width a scan pulse may have
+    PW_MAX = 25
+    TRAIN = 1.5             # x the pulse period: a longer gap between pulses ends a train
+    EXTRA = 0.5             # x the median closed time: shorter is an extra closure, not a cycle
+}
+
+func median(a, n,    b, i) {
+    if (!n) return 0
+    for (i = 1; i <= n; ++i) b[i] = a[i]
+    asort(b)
+    return n % 2 ? b[(n + 1) / 2] : (b[n / 2] + b[n / 2 + 1]) / 2
+}
+
+# the same over an array with holes
+func mediani(a,    b, i, n) {
+    n = 0
+    for (i in a) b[++n] = a[i]
+    return median(b, n)
+}
+
+# one event of edges is complete: a pulse, a reed switching, or neither
+func cluster(    w, k) {
+    if (!c_n) return
+    w = c_t1 - c_t0
+    if (c_before == c_after) {
+        if (c_n == 2 && !c_merged && w >= PW_MIN && w <= PW_MAX) {
+            k = c_before ? "dip" : "spike"
+            ++npulse[k]
+            p_t[++np] = c_t0
+            if (c_key) ++wkey[sprintf("%-5s %2.0f", k, w)]
+            else ++wfree[sprintf("%-5s %2.0f", k, w)]
+        } else {
+            ++glitches
+        }
+    } else if (c_after) {
+        r_close[++nr] = c_t0            # with dips: the reed closes
+        r_bounce[nr] = c_n - 1
+    } else if (nr && !(nr in r_open)) {
+        r_open[nr] = c_t0               # ... and opens
+    }
+    merged += c_merged
+    c_n = 0
+}
+
+func edge(t, l) {
+    if (c_n && t - c_t1 >= CLUSTER) cluster()
+    if (lvl == "") lvl = !l             # no "=" line before it: assume a change
+    if (!c_n) {
+        c_t0 = t
+        c_before = lvl
+        c_merged = 0
+        c_key = inkey                   # classified only once the next event is seen, maybe after "done"
+    }
+    if (l == lvl) ++c_merged
+    c_t1 = t
+    c_after = lvl = l
+    ++c_n
+    ++nedge
+}
+
+# what the reed did between s and e, the run of the cmd at s
+func run(name, s, e,    i, k, n, m, x, idx, cl, mc, reg, op, per, first, last, a, b) {
+    n = 0
+    for (i = 1; i <= nc; ++i) {
+        if (rc[i] >= s && rc[i] < e) idx[++n] = i
+    }
+    printf "cmd %-9s at %.3f s", name, s / 1e6
+    if (!n) {
+        printf ", the reed did not switch\n"
+        return
+    }
+    first = rc[idx[1]]
+    i = idx[n]
+    last = ro[i] != "" && ro[i] < e ? ro[i] : rc[i]
+    printf ", switching %.0f ms later for %.2f s\n", (first - s) / 1000, (last - first) / 1e6
+
+    # regular closures, and the extra ones in between
+    m = 0
+    for (k = 1; k <= n; ++k) {
+        i = idx[k]
+        if (ro[i] != "") cl[++m] = ro[i] - rc[i]
+    }
+    mc = median(cl, m)
+    m = x = 0
+    for (k = 1; k <= n; ++k) {
+        i = idx[k]
+        if (ro[i] != "" && ro[i] - rc[i] < EXTRA * mc && m && ro[reg[m]] != "") {
+            ++x
+            xc[x] = m                           # inside the open phase after regular closure m
+            xl[x] = ro[i] - rc[i]
+            xa[x] = rc[i] - ro[reg[m]]
+            xb[x] = k < n ? rc[idx[k + 1]] - ro[i] : ""
+            continue
+        }
+        reg[++m] = i
+    }
+    delete cl
+    for (k = 1; k <= m; ++k) {
+        i = reg[k]
+        if (ro[i] != "") cl[k] = ro[i] - rc[i]
+        if (k < m) {
+            per[k] = rc[reg[k + 1]] - rc[i]
+            if (ro[i] != "") op[k] = rc[reg[k + 1]] - ro[i]
+        }
+    }
+    printf "              %d cycles, median %.1f ms: closed %.1f ms, open %.1f ms, duty %.1f%%\n", \
+           m, mediani(per) / 1000, mediani(cl) / 1000, mediani(op) / 1000, \
+           mediani(per) ? 100 * mediani(cl) / mediani(per) : 0
+    if (x) {
+        printf "              %d extra closure%s, each inside the open phase after a cycle:\n", x, (x > 1 ? "s" : "")
+        printf "              %6s %8s %13s %13s\n", "cycle", "closed", "after cycle", "before next"
+        for (k = 1; k <= x; ++k) {
+            printf "              %6d %8.1f %13.1f %13s   %s\n", xc[k], xl[k] / 1000, xa[k] / 1000, \
+                   xb[k] == "" ? "-" : sprintf("%.1f", xb[k] / 1000), \
+                   (xb[k] == "" ? "" : xa[k] > xb[k] ? "late" : "early")
+        }
+    }
+    if (cycles) {
+        printf "              %5s %10s %8s %8s %8s %7s  %s\n", "cycle", "close s", "closed", "open", "period", "bounce", "extra"
+        for (k = 1; k <= m; ++k) {
+            a = ""
+            for (b = 1; b <= x; ++b) if (xc[b] == k) a = a sprintf(" %.1f@%.1f", xl[b] / 1000, xa[b] / 1000)
+            printf "              %5d %10.4f %8s %8s %8s %7s %s\n", k, rc[reg[k]] / 1e6, \
+                   k in cl ? sprintf("%.1f", cl[k] / 1000) : "-", \
+                   k in op ? sprintf("%.1f", op[k] / 1000) : "-", \
+                   k in per ? sprintf("%.1f", per[k] / 1000) : "-", rb[reg[k]], a
+        }
+    }
+
+    # for -t: in position order, an extra closure belongs between the same two cycles either way
+    T_name[++T_n] = sprintf("%s %s@%.0f", fname, name, s / 1e6)
+    T_len[T_n] = m
+    for (k = 1; k <= m; ++k) {
+        b = name == "DOWN" ? m + 1 - k : k
+        T_cl[T_n, b] = k in cl ? sprintf("%.0f", cl[k] / 1000) : "-"
+    }
+    for (k = 1; k <= x; ++k) {
+        b = name == "DOWN" ? m - xc[k] : xc[k]
+        T_x[T_n, b] = sprintf("x%.0f", xl[k] / 1000)
+    }
+    delete xc; delete xl; delete xa; delete xb
+}
+
+func report(    i, j, n, pe, per, k, dips) {
+    cluster()
+    printf "== %s  %s  %.1f s  %d edges  %d lost  %d merged  %d glitches\n", \
+           fname, fw, tend / 1e6, nedge, lost, merged, glitches
+
+    # scan pulses: their period from the spacing inside trains
+    n = 0
+    for (i = 2; i <= np; ++i) {
+        if (p_t[i] - p_t[i - 1] < 25000) per[++n] = p_t[i] - p_t[i - 1]
+    }
+    pe = median(per, n)
+    printf "scan pulses   %d dips, %d spikes, period %.3f ms (%.2f Hz)\n", \
+           npulse["dip"], npulse["spike"], pe / 1000, pe ? 1e6 / pe : 0
+    PROCINFO["sorted_in"] = "@ind_str_asc"
+    for (k in wfree) printf "              %s us %6d\n", k, wfree[k]
+    for (k in wkey)  printf "              %s us %6d   while a key is pressed\n", k, wkey[k]
+    delete PROCINFO["sorted_in"]
+
+    # the reed: from the line level with dips, else from the pulse trains
+    dips = npulse["dip"] >= npulse["spike"]
+    nc = 0
+    if (dips) {
+        for (i = 1; i <= nr; ++i) {
+            rc[++nc] = r_close[i]
+            ro[nc] = i in r_open ? r_open[i] : ""
+            rb[nc] = r_bounce[i]
+        }
+    } else {
+        for (i = 1; i <= np; ++i) {
+            if (i == 1 || p_t[i] - p_t[i - 1] > TRAIN * pe) {
+                if (nc) ro[nc] = p_t[i - 1]
+                rc[++nc] = p_t[i]
+                rb[nc] = "-"
+            }
+        }
+        if (nc && p_t[np] < tend - TRAIN * pe) ro[nc] = p_t[np]
+    }
+    printf "reed          %d closures, from the %s\n", nc, dips ? "line level (exact)" : "pulse trains (+-1 period)"
+
+    for (j = 1; j <= nm; ++j) {
+        run(m_c[j], m_t[j], j < nm ? m_t[j + 1] : tend)
+    }
+}
+
+func positions(    r, k, n, row) {
+    n = 0
+    for (r = 1; r <= T_n; ++r) {
+        if (T_len[r] > n) n = T_len[r]
+    }
+    print ""
+    print "closed ms per cycle, one row per shutter position (UP as recorded, DOWN reversed), xNN: an extra closure"
+    for (r = 1; r <= T_n; ++r) printf "%8d  %s\n", r, T_name[r]
+    printf "%5s", "cycle"
+    for (r = 1; r <= T_n; ++r) printf " %9d", r
+    print ""
+    for (k = 1; k <= n; ++k) {
+        row = sprintf("%5d", k)
+        for (r = 1; r <= T_n; ++r) {
+            row = row sprintf(" %9s", T_cl[r, k] (((r, k) in T_x) ? " " T_x[r, k] : "    "))
+        }
+        sub(/ +$/, "", row)
+        print row
+    }
+}
+
+FNR == 1 {
+    if (NR > 1) report()
+    fname = FILENAME
+    fw = ""; lvl = ""; nedge = lost = merged = glitches = np = nr = nm = nc = c_n = inkey = tend = 0
+    delete npulse; delete p_t; delete wfree; delete wkey
+    delete r_close; delete r_open; delete r_bounce
+    delete rc; delete ro; delete rb; delete m_t; delete m_c
+}
+/^# reedrec / {
+    fw = $3
+    next
+}
+/^#/ {
+    next
+}
+{
+    tend = $1
+}
+$2 == "=" {
+    if (lvl == "") lvl = $3
+    next
+}
+$2 == "0" || $2 == "1" {
+    edge($1, $2)
+    next
+}
+$2 == "cmd" {
+    m_t[++nm] = $1
+    m_c[nm] = $3
+    inkey = 1
+    next
+}
+$2 == "done" {
+    inkey = 0
+    next
+}
+$2 == "lost" {
+    lost += $3
+    cluster()           # whatever was cut off, it is not one event any more
+    next
+}
+END {
+    if (NR) report()
+    if (table) positions()
+}
+' "$@"

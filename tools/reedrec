@@ -1,0 +1,118 @@
+#!/bin/sh
+#
+# reedrec - record the reed line of an ultra-shutlifter, optionally while driving the lifter
+#           through a list of service port commands
+#
+# usage:  reedrec [-p port] [-c port] [-q secs] [-t secs] host [CMD ...] > file.rec
+#
+#   -p   recorder port, default 8889 (REEDREC_PORT in main/ultra_shutlifter.c)
+#   -c   service port the CMDs go to, default 8888
+#   -q   quiet time that counts as "the motor has stopped", default 5s
+#   -t   longest wait for one CMD to go quiet, default 300s
+#
+# copies the device's stream to stdout as it comes. without a CMD it records until interrupted.
+# with CMDs, e.g.
+#
+#     reedrec $LIFTER DOWN UP > downup.rec
+#
+# the first CMD goes out after a second of idle recording, every further one once the previous
+# has gone quiet: no train of scan pulses began or ended for -q secs after the device started
+# executing it. the recording ends once the last CMD has gone quiet as well. quiet is judged on
+# the device's own clock, from the stream itself, so network delays never enter it. the service
+# port's one-line replies go to stderr.
+#
+# a train of scan pulses is what a closed reed lets through, whichever state the lifter's CLK
+# LED is in (see README.md) - so "no train began or ended" means the reed has stopped switching,
+# whether it came to rest closed or open.
+#
+# needs gawk and OpenBSD netcat (nc -d: never read stdin, so the connection stays open)
+#
+
+RPORT=8889
+CPORT=8888
+QUIET=5
+TMAX=300
+
+usage() {
+    sed -n '/^# usage/,/^#   -t/s/^# \{0,1\}//p' "$0" >&2
+    exit 1
+}
+
+while getopts p:c:q:t: o; do
+    case $o in
+    p) RPORT=$OPTARG ;;
+    c) CPORT=$OPTARG ;;
+    q) QUIET=$OPTARG ;;
+    t) TMAX=$OPTARG ;;
+    *) usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || usage
+HOST=$1
+shift
+for c in "$@"; do
+    case $c in
+    *[!A-Za-z0-9_@=.]*) echo "reedrec: not a service port command: $c" >&2; exit 1 ;;
+    esac
+done
+
+nc -d "$HOST" "$RPORT" | gawk -v host="$HOST" -v cport="$CPORT" -v cmds="$*" \
+                              -v quiet="$QUIET" -v tmax="$TMAX" '
+BEGIN {
+    GAP = 40000             # us without an edge that ends a train (scan pulses come every 16.35ms)
+    ncmd = split(cmds, cmd, " ")
+    quiet *= 1e6
+    tmax *= 1e6
+    state = ncmd ? "idle" : "free"
+}
+
+func send(i) {
+    printf "reedrec: %s\n", cmd[i] > "/dev/stderr"
+    system("echo " cmd[i] " | nc -w 5 " host " " cport " >&2")
+    sent = now
+    state = "sent"
+}
+
+{
+    print
+    fflush()
+}
+/^#/ {
+    next
+}
+{
+    now = $1
+}
+$2 == "0" || $2 == "1" {
+    if (last_edge != "" && now - last_edge > GAP) {
+        change = now                    # a train begins
+    }
+    last_edge = now
+    gapped = 0
+}
+last_edge != "" && !gapped && now - last_edge > GAP {
+    change = last_edge                  # the train ended with its last edge
+    gapped = 1
+}
+state == "sent" && $2 == "cmd" {
+    started = now
+    state = "running"
+}
+state == "idle" && now >= 1e6 {
+    send(ci = 1)
+}
+state == "sent" && now - sent > tmax {
+    printf "reedrec: %s never started\n", cmd[ci] > "/dev/stderr"
+    exit 1
+}
+state == "running" && (now - (change > started ? change : started) >= quiet || now - started > tmax) {
+    if (now - started > tmax) {
+        printf "reedrec: %s did not go quiet within the -t time\n", cmd[ci] > "/dev/stderr"
+    }
+    if (++ci > ncmd) {
+        exit
+    }
+    send(ci)
+}
+'
