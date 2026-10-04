@@ -14,7 +14,8 @@
 #   scan pulses  the lifter tests its reed by pulsing the line every 16.35ms. with the CLK LED off
 #                the line idles high and a pulse is a dip, with it on the line idles low and a
 #                pulse is a spike - only a closed reed lets either through. their width, and
-#                separately the width of those that fall into a key press
+#                separately the width of those that fall into a key press. a pause of 40-48ms in
+#                the pulses is listed on its own: the lifter shows one whenever its motor stops
 #   reed         when the reed closed and opened. with dips the line follows the reed itself and
 #                the edges give the exact switching times, bounce included. with spikes only the
 #                pulses can tell, so a closure is the run of pulses, good to one pulse period
@@ -23,7 +24,10 @@
 #                (close to close), duty - as medians, since those at start and stop are not like
 #                the rest. a closure shorter than EXTRA x the median closed time is no cycle of
 #                its own: it is an extra one inside an open phase, and is listed with where it sat
-#                in that phase - how long after the closure before it, and how long before the next
+#                in that phase - how long after the closure before it, and how long before the next.
+#                and the median width of the wide pulses (over WIDE us): with the CLK LED on, the
+#                lifter widens every few pulses while its motor runs, to a width that differs
+#                between UP and DOWN (README.md)
 #
 # edges closer than CLUSTER us are taken as one event (bounce, or a pulse's two edges). two edges
 # of one direction a few us apart can reach the recording as one (README.md), seen as a level
@@ -50,9 +54,12 @@ exec gawk -v cycles="$CYCLES" -v table="$TABLE" '
 BEGIN {
     CLUSTER = 200           # us between edges of one event
     PW_MIN = 10             # us, the width a scan pulse may have
-    PW_MAX = 25
+    PW_MAX = 100
     TRAIN = 1.5             # x the pulse period: a longer gap between pulses ends a train
     EXTRA = 0.5             # x the median closed time: shorter is an extra closure, not a cycle
+    WIDE = 50               # us, a wider scan pulse is a wide one
+    PAUSE_MIN = 40000       # us between two pulses that make a pause in them
+    PAUSE_MAX = 48000
 }
 
 func median(a, n,    b, i) {
@@ -78,8 +85,9 @@ func cluster(    w, k) {
             k = c_before ? "dip" : "spike"
             ++npulse[k]
             p_t[++np] = c_t0
-            if (c_key) ++wkey[sprintf("%-5s %2.0f", k, w)]
-            else ++wfree[sprintf("%-5s %2.0f", k, w)]
+            p_w[np] = w
+            k = k (c_key ? " key" : " free")
+            wl[k, ++wn[k]] = w
         } else {
             ++glitches
         }
@@ -107,6 +115,24 @@ func edge(t, l) {
     c_after = lvl = l
     ++c_n
     ++nedge
+}
+
+# the median width of the wide pulses from s to e, "" if there are none
+func widemed(s, e,    i, n, a) {
+    n = 0
+    for (i = 1; i <= np; ++i) {
+        if (p_t[i] >= s && p_t[i] <= e && p_w[i] > WIDE) a[++n] = p_w[i]
+    }
+    return n ? sprintf("%.2f", median(a, n)) : ""
+}
+
+# the number of wide pulses from s to e
+func widen(s, e,    i, n) {
+    n = 0
+    for (i = 1; i <= np; ++i) {
+        if (p_t[i] >= s && p_t[i] <= e && p_w[i] > WIDE) ++n
+    }
+    return n
 }
 
 # what the reed did between s and e, the run of the cmd at s
@@ -154,9 +180,18 @@ func run(name, s, e,    i, k, n, m, x, idx, cl, mc, reg, op, per, first, last, a
             if (ro[i] != "") op[k] = rc[reg[k + 1]] - ro[i]
         }
     }
-    printf "              %d cycles, median %.1f ms: closed %.1f ms, open %.1f ms, duty %.1f%%\n", \
-           m, mediani(per) / 1000, mediani(cl) / 1000, mediani(op) / 1000, \
-           mediani(per) ? 100 * mediani(cl) / mediani(per) : 0
+    if (length(per)) {
+        printf "              %d cycles, median %.1f ms: closed %.1f ms, open %.1f ms, duty %.1f%%\n", \
+               m, mediani(per) / 1000, mediani(cl) / 1000, mediani(op) / 1000, \
+               100 * mediani(cl) / mediani(per)
+    } else {
+        printf "              %d closure%s, no full cycle\n", m, (m > 1 ? "s" : "")
+    }
+    a = widen(s, e)
+    if (a) printf "              %d wide pulse%s, median %s us\n", a, (a > 1 ? "s" : ""), widemed(s, e)
+    for (k = 1; k <= npause; ++k) {
+        if (pz_t[k] >= s && pz_t[k] < e) printf "              scan pause at %.3f s: %.2f ms, then %.2f ms\n", pz_t[k] / 1e6, pz_a[k] / 1000, pz_b[k] / 1000
+    }
     if (x) {
         printf "              %d extra closure%s, each inside the open phase after a cycle:\n", x, (x > 1 ? "s" : "")
         printf "              %6s %8s %13s %13s\n", "cycle", "closed", "after cycle", "before next"
@@ -167,14 +202,16 @@ func run(name, s, e,    i, k, n, m, x, idx, cl, mc, reg, op, per, first, last, a
         }
     }
     if (cycles) {
-        printf "              %5s %10s %8s %8s %8s %7s  %s\n", "cycle", "close s", "closed", "open", "period", "bounce", "extra"
+        printf "              %5s %10s %8s %8s %8s %7s %6s  %s\n", "cycle", "close s", "closed", "open", "period", "bounce", "wide", "extra"
         for (k = 1; k <= m; ++k) {
             a = ""
             for (b = 1; b <= x; ++b) if (xc[b] == k) a = a sprintf(" %.1f@%.1f", xl[b] / 1000, xa[b] / 1000)
-            printf "              %5d %10.4f %8s %8s %8s %7s %s\n", k, rc[reg[k]] / 1e6, \
+            i = reg[k]
+            b = widemed(rc[i], ro[i] != "" ? ro[i] : e)
+            printf "              %5d %10.4f %8s %8s %8s %7s %6s %s\n", k, rc[i] / 1e6, \
                    k in cl ? sprintf("%.1f", cl[k] / 1000) : "-", \
                    k in op ? sprintf("%.1f", op[k] / 1000) : "-", \
-                   k in per ? sprintf("%.1f", per[k] / 1000) : "-", rb[reg[k]], a
+                   k in per ? sprintf("%.1f", per[k] / 1000) : "-", rb[i], b == "" ? "-" : b, a
         }
     }
 
@@ -192,7 +229,7 @@ func run(name, s, e,    i, k, n, m, x, idx, cl, mc, reg, op, per, first, last, a
     delete xc; delete xl; delete xa; delete xb
 }
 
-func report(    i, j, n, pe, per, k, dips) {
+func report(    i, j, n, g, pe, per, k, dips, wa, wg) {
     cluster()
     printf "== %s  %s  %.1f s  %d edges  %d lost  %d merged  %d glitches\n", \
            fname, fw, tend / 1e6, nedge, lost, merged, glitches
@@ -203,11 +240,32 @@ func report(    i, j, n, pe, per, k, dips) {
         if (p_t[i] - p_t[i - 1] < 25000) per[++n] = p_t[i] - p_t[i - 1]
     }
     pe = median(per, n)
-    printf "scan pulses   %d dips, %d spikes, period %.3f ms (%.2f Hz)\n", \
-           npulse["dip"], npulse["spike"], pe / 1000, pe ? 1e6 / pe : 0
-    PROCINFO["sorted_in"] = "@ind_str_asc"
-    for (k in wfree) printf "              %s us %6d\n", k, wfree[k]
-    for (k in wkey)  printf "              %s us %6d   while a key is pressed\n", k, wkey[k]
+    npause = 0
+    for (i = 2; i <= np; ++i) {
+        if (p_t[i] - p_t[i - 1] > PAUSE_MIN && p_t[i] - p_t[i - 1] < PAUSE_MAX) {
+            pz_t[++npause] = p_t[i]
+            pz_a[npause] = p_t[i] - p_t[i - 1]
+            pz_b[npause] = i < np ? p_t[i + 1] - p_t[i] : 0
+        }
+    }
+    printf "scan pulses   %d dips, %d spikes, period %.3f ms (%.2f Hz), %d pause%s\n", \
+           npulse["dip"], npulse["spike"], pe / 1000, pe ? 1e6 / pe : 0, npause, npause == 1 ? "" : "s"
+    # widths come in steps, the instruction timing of the lifter: one line per group within 0.25us
+    PROCINFO["sorted_in"] = "@ind_str_asc"          # "free" before "key"
+    for (k in wn) {
+        delete wa
+        for (i = 1; i <= wn[k]; ++i) wa[i] = wl[k, i]
+        asort(wa)
+        g = 1
+        for (i = 2; i <= wn[k] + 1; ++i) {
+            if (i <= wn[k] && wa[i] - wa[g] < 0.25) continue
+            delete wg
+            for (j = g; j < i; ++j) wg[j - g + 1] = wa[j]
+            printf "              %-5s %6.2f us %6d%s\n", substr(k, 1, index(k, " ") - 1), median(wg, i - g), i - g, \
+                   k ~ / key$/ ? "   while a key is pressed" : ""
+            g = i
+        }
+    }
     delete PROCINFO["sorted_in"]
 
     # the reed: from the line level with dips, else from the pulse trains
@@ -261,7 +319,7 @@ FNR == 1 {
     if (NR > 1) report()
     fname = FILENAME
     fw = ""; lvl = ""; nedge = lost = merged = glitches = np = nr = nm = nc = c_n = inkey = tend = 0
-    delete npulse; delete p_t; delete wfree; delete wkey
+    delete npulse; delete p_t; delete p_w; delete wl; delete wn; delete pz_t; delete pz_a; delete pz_b
     delete r_close; delete r_open; delete r_bounce
     delete rc; delete ro; delete rb; delete m_t; delete m_c
 }

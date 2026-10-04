@@ -3,7 +3,7 @@
 # reedrec - record the reed line of an ultra-shutlifter, optionally while driving the lifter
 #           through a list of service port commands
 #
-# usage:  reedrec [-p port] [-c port] [-q secs] [-t secs] host [CMD ...] > file.rec
+# usage:  reedrec [-p port] [-c port] [-q secs] [-t secs] host [CMD[/secs] ...] > file.rec
 #
 #   -p   recorder port, default 8889 (REEDREC_PORT in main/ultra_shutlifter.c)
 #   -c   service port the CMDs go to, default 8888
@@ -20,6 +20,14 @@
 # executing it. the recording ends once the last CMD has gone quiet as well. quiet is judged on
 # the device's own clock, from the stream itself, so network delays never enter it. the service
 # port's one-line replies go to stderr.
+#
+# CMD/secs does not wait for quiet: the next CMD - or the end - comes secs after this one
+# started, so a key can be pressed while the motor runs, e.g. to stop it halfway
+#
+#     reedrec $LIFTER UP/7 UP > stop.rec
+#
+# the timing is as good as the stream lines are dense, a few 10ms while the reed is closed and
+# up to half a second while it is open. the cmd lines in the recording say when it really was.
 #
 # a train of scan pulses is what a closed reed lets through, whichever state the lifter's CLK
 # LED is in (see README.md) - so "no train began or ended" means the reed has stopped switching,
@@ -52,8 +60,13 @@ shift $((OPTIND - 1))
 HOST=$1
 shift
 for c in "$@"; do
+    case ${c%/*} in
+    ''|*[!A-Za-z0-9_@=.]*) echo "reedrec: not a service port command: $c" >&2; exit 1 ;;
+    esac
     case $c in
-    *[!A-Za-z0-9_@=.]*) echo "reedrec: not a service port command: $c" >&2; exit 1 ;;
+    */*) case ${c#*/} in
+         ''|*[!0-9.]*) echo "reedrec: not a time in seconds: $c" >&2; exit 1 ;;
+         esac ;;
     esac
 done
 
@@ -62,9 +75,21 @@ nc -d "$HOST" "$RPORT" | gawk -v host="$HOST" -v cport="$CPORT" -v cmds="$*" \
 BEGIN {
     GAP = 40000             # us without an edge that ends a train (scan pulses come every 16.35ms)
     ncmd = split(cmds, cmd, " ")
+    for (i = 1; i <= ncmd; ++i) {
+        hold[i] = split(cmd[i], a, "/") > 1 ? a[2] * 1e6 : 0       # CMD/secs
+        cmd[i] = a[1]
+    }
     quiet *= 1e6
     tmax *= 1e6
     state = ncmd ? "idle" : "free"
+}
+
+# the next CMD, or the end
+func advance() {
+    if (++ci > ncmd) {
+        exit
+    }
+    send(ci)
 }
 
 func send(i) {
@@ -106,13 +131,16 @@ state == "sent" && now - sent > tmax {
     printf "reedrec: %s never started\n", cmd[ci] > "/dev/stderr"
     exit 1
 }
+state == "running" && hold[ci] {
+    if (now - started >= hold[ci]) {
+        advance()
+    }
+    next
+}
 state == "running" && (now - (change > started ? change : started) >= quiet || now - started > tmax) {
     if (now - started > tmax) {
         printf "reedrec: %s did not go quiet within the -t time\n", cmd[ci] > "/dev/stderr"
     }
-    if (++ci > ncmd) {
-        exit
-    }
-    send(ci)
+    advance()
 }
 '

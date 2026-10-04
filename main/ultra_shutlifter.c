@@ -118,9 +118,10 @@ _u32 new_movement;                      // timestamp of last (still unreported) 
  * - so if the reed relais closes contact we read the voltage present on rail_2. with the contact
  *   open the divider holds PIN_REED at 0V
  * - rail_2 basically controls the CLK LED cathode voltage meaning that: 5V on rail_2 - CLK LED OFF/ 0V on rail_2 - CLK LED ON
- * - additionally voltage on rail_2 is continuously overlaid by pulses at frequency 61Hz (every 16.35ms) and pulse width of
- *   14us - 17us while the GW60 sees one of its keys pressed. with the CLK LED off a pulse is a dip to 0V, with the LED on
- *   it should be a spike to 5V (not recorded yet)
+ * - additionally voltage on rail_2 is continuously overlaid by pulses at frequency 61Hz (every 16.35ms). with the CLK LED
+ *   off a pulse is a dip to 0V, 14us wide - 17us while the GW60 sees one of its keys pressed. with the LED on it is a
+ *   spike to 5V, 18us or 19us wide, and while the motor runs every few spikes is a wide one: 77.8us going up, 78.8us or
+ *   79.3us going down (from 0.25s after the start on). whenever the motor stops, the pulses pause for ~44ms
  * - with the CLK LED off, PIN_REED follows the reed contact itself between the pulses: the contact closing is a rising
  *   edge at any phase, followed by ~70us of bounce - rising edges for reed_intrs() too, at no 16ms distance
  * - the small magnetic wheel (with 2 magnets baked in) causes ~280ms in length reed contact closures being spaced at
