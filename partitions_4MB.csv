@@ -1,0 +1,24 @@
+# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
+
+# ESP-IDF Partition Table
+# Name,      Type, SubType, Offset,   Size,    Flags
+
+#---------------------------------------------------
+# 4MB VARIANT: 
+
+#I (59) boot: ## Label            Usage          Type ST Offset   Length
+#I (66) boot:  0 nvs              WiFi data        01 02 00009000 00004000    16384
+#I (74) boot:  1 otadata          OTA data         01 00 0000d000 00002000     8192   24576
+#I (81) boot:  2 phy_init         RF data          01 01 0000f000 00001000     4096   28672
+#I (89) boot:  3 ota_0            OTA app          00 10 00010000 001f0000  2031616 2060288
+#I (96) boot:  4 ota_1            OTA app          00 11 00200000 001f0000  2031616 4091904
+#I (99) boot:  5 fr               Unknown data     01 06 003f0000 00019000   102400 4194304 == 0x400000
+#I (99) boot: End of partition table
+
+nvs,       data, nvs,     ,         0x4000,
+otadata,   data, ota,     ,         0x2000,
+phy_init,  data, phy,     ,         0x1000,  
+ota_0,     app,  ota_0,   ,         0x1f0000,
+ota_1,     app,  ota_1,   ,         0x1f0000,
+#fr,        data,      ,   ,         0x19000,   does not fit on some s3 variants
+
