@@ -20,6 +20,8 @@
  * RESTART      send restart cmd                    reboot
  * NOOP         send noop cmd                       return status alone
  * OTA          send OTA cmd                        flash firmware if avail
+ * @autostop=XX set autostop                        set duration for moving stop point away from current position (ms)
+ * @autostop    read autostop                       return status alone
  *
  *
  * status fields returned after getting a cmd (example for CLK cmd):
@@ -27,7 +29,7 @@
  * #[CLK]#[0]#[0]#[0]#[-67/1/0/200]#[0]
  *   ^                 ^   ^ ^  ^                          
  *   cmd            RSSI   |  \  \                                                             
- *                         |   \  `------- duration for moving stop point away from current position (ms)
+ *                         |   \  `------- autostop (ms)
  *                   !CLK_LED   \                           
  *                               \                         
  *                            time since last movement (s)
