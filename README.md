@@ -16,11 +16,56 @@ what is it
 
         echo DOWN | nc $LIFTER 8888
 
-  `$LIFTER` stands for the device's address, here and below. the commands are `UP` `DOWN` `SET`
-  `CLK` `SUN` (one key each), `SUNTRIG` `DIR` `UP_TIMER` `DOWN_TIMER` `UP_STOP` `DOWN_STOP`
-  `FACRESET` (key combinations, see `main/ultra_shutlifter.c`), `RESTART`, `NOOP`, `OTA` and
-  `@autostop` / `@autostop=<ms>`. the fifth field of the status line holds the RSSI, the reed
-  level (see below), the seconds since the last movement and the autostop time
+  `$LIFTER` stands for the device's address, here and below
+
+the commands
+------------
+
+each one is a key press, or a sequence of them, on the GW60's own panel. the durations are what
+the firmware holds the keys for; the effects are the GW60's, as its manual has them:
+
+        cmd          keys               duration    effect
+
+        UP           UP                 500ms       move shutter up
+        DOWN         DOWN               500ms       move shutter down
+        SET          SET                500ms       none
+        CLK          CLK                2s          toggle timer on/off (if any)
+        SUN          SUN                2s          toggle sun trig on/off
+
+        SUNTRIG      CLK + SUN          500ms       set sun trig
+        DIR          SET                12s         reverse up/down direction
+        UP_TIMER     CLK + UP           200+500ms   program up timer
+        DOWN_TIMER   CLK + DOWN         200+500ms   program down timer
+        UP_STOP      SET + UP           @autostop   move the upper end position
+        DOWN_STOP    SET + DOWN         @autostop   move the lower end position
+        FACRESET     CLK + DOWN + UP    200ms+6s    factory reset the GW60
+
+        RESTART      -                  -           reboot the ESP32
+        NOOP         -                  -           answer with the status alone
+        OTA          -                  -           fetch new firmware if the server has any
+
+- where the duration has two parts, CLK goes down 200ms before the other keys: that is what makes
+  the GW60 read the combination instead of starting the motor. `SUNTRIG`, `UP_STOP` and
+  `DOWN_STOP` press their keys together
+- `@autostop` returns the duration `UP_STOP` and `DOWN_STOP` press for, `@autostop=<ms>` sets it.
+  it is 200ms after every boot and lives in RAM only. the longer the press, the further the end
+  position moves away from where the shutter stands
+- the status line is sent before the key is pressed, so it describes the state just before:
+
+        #[CLK]#[0]#[0]#[0]#[-67/1/0/200]#[0]
+
+  the first field echoes the command as it was understood, the last is 0 for ok and 1 when the
+  command or the variable was not accepted, the three in between belong to the author's status
+  protocol and are always 0 here, and the fifth carries four values:
+
+        -67     RSSI in dBm
+        1       the reed line's idle level: the CLK LED inverted while the reed is closed,
+                and 0 whenever the reed is open (see below)
+        0       seconds since the last movement was reported
+        200     @autostop in ms
+
+- `main/ultra_shutlifter.c` opens with the same table and a shell loop that walks every command in
+  one go. on a winder in use, mind that `DIR` and `FACRESET` change the GW60's own settings
 
 software installation
 ---------------------
