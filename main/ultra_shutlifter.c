@@ -977,14 +977,16 @@ TP05
      * the idf handlers reconnect on every disconnect by themselves, so ur_connect() replaces both.
      * WIFI_CONN_WAIT because nothing this device does happens without the link - the movement
      * report as much as every single cmd - and the idf mysend() would otherwise block without any
-     * timeout before the first IP of a boot. WIFI_PS_MIN_MODEM because that is what arduino-esp32
-     * set underneath init_3rd() (WiFiGenericClass::_sleepEnabled).
-     * it comes last so the reed interrupt is already counting while we wait for the accesspoint
+     * timeout before the first IP of a boot. WIFI_PS_NONE: the device never sleeps, and
+     * arduino's WIFI_PS_MIN_MODEM (WiFiGenericClass::_sleepEnabled), which this port first kept,
+     * made the AP hold every packet to it until the next DTIM - ping measured 10..230ms, avg ~120ms
+     * (2026_10_09). it comes last so the reed interrupt is already counting while we wait for the
+     * accesspoint
      */
 #if ESP32_(2)
-    if (ur_connect(ROTA2K_SSID, WIFI_CONN_WAIT, WIFI_CONN_SLOW_FAIL, WIFI_PS_MIN_MODEM)) {
+    if (ur_connect(ROTA2K_SSID, WIFI_CONN_WAIT, WIFI_CONN_SLOW_FAIL, WIFI_PS_NONE)) {
 #else
-    if (ur_connect(UFIRE_SSID, WIFI_CONN_WAIT, WIFI_CONN_SLOW_FAIL, WIFI_PS_MIN_MODEM)) {
+    if (ur_connect(UFIRE_SSID, WIFI_CONN_WAIT, WIFI_CONN_SLOW_FAIL, WIFI_PS_NONE)) {
 #endif
         PR05("can't ur_connect, rebooting...\n");
         esp_restart();
